@@ -1,0 +1,188 @@
+name: Subdomain & Vulnerability Scanner (Telegram)
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan'
+        required: true
+        default: 'example.com'
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install System Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3-pip
+
+      - name: Install Tools
+        run: |
+          # install go tools (use specific versions if تريد ثبات)
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest || true
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest || true
+          go install -v github.com/tomnomnom/assetfinder@latest || true
+          go install -v github.com/OWASP/Amass/v3/...@latest || true
+
+          # python tool
+          pip3 install --user sublist3r || true
+
+          # ensure PATH for go and pip user installs
+          echo "PATH=$(go env GOPATH)/bin:$HOME/.local/bin:$PATH" >> $GITHUB_ENV
+
+      - name: Validate Secrets
+        run: |
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] || [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "::error::Telegram secrets TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID are missing"
+            exit 1
+          fi
+          echo "BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}" >> $GITHUB_ENV
+          echo "CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}" >> $GITHUB_ENV
+
+      - name: Set Domain
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=example.com" >> $GITHUB_ENV
+          fi
+
+      - name: Notify Start (Telegram)
+        env:
+          BOT_TOKEN: ${{ env.BOT_TOKEN }}
+          CHAT_ID: ${{ env.CHAT_ID }}
+        run: |
+          BOT_TOKEN="${BOT_TOKEN}"
+          CHAT_ID="${CHAT_ID}"
+          MSG="🔍 *Scan Started*\n*Domain:* ${DOMAIN}\n*Trigger:* ${{ github.event_name }}\n*Tools:* Subfinder + Assetfinder + Sublist3r + Amass + Nuclei"
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            -d "parse_mode=Markdown"
+
+      - name: Run Enumeration (multi-tool)
+        run: |
+          set -u
+          DOMAIN="${DOMAIN}"
+          OUT_DIR=./scan_output
+          mkdir -p "$OUT_DIR"
+
+          echo "[*] Running subfinder..."
+          subfinder -d "$DOMAIN" -silent -o "$OUT_DIR/subfinder.txt" || true
+
+          echo "[*] Running assetfinder..."
+          assetfinder --subs-only "$DOMAIN" > "$OUT_DIR/assetfinder.txt" 2>/dev/null || true
+
+          echo "[*] Running sublist3r..."
+          sublist3r -d "$DOMAIN" -o "$OUT_DIR/sublist3r.txt" || true
+
+          echo "[*] Running amass (passive)..."
+          amass enum -passive -d "$DOMAIN" -o "$OUT_DIR/amass.txt" || true
+
+          echo "[*] Merging results..."
+          cat "$OUT_DIR"/*.txt 2>/dev/null | sed 's/\r$//' | sed '/^\s*$/d' | sort -u > subdomains.txt || true
+          echo "SUBDOMAINS_FOUND=$(wc -l < subdomains.txt || true)" >> $GITHUB_ENV
+          echo "[*] Found $(wc -l < subdomains.txt || true) unique subdomains."
+
+      - name: Notify Subdomains Result (Telegram / or upload if too big)
+        env:
+          BOT_TOKEN: ${{ env.BOT_TOKEN }}
+          CHAT_ID: ${{ env.CHAT_ID }}
+        run: |
+          BOT_TOKEN="${BOT_TOKEN}"
+          CHAT_ID="${CHAT_ID}"
+          COUNT=0
+          if [ -f subdomains.txt ]; then
+            COUNT=$(wc -l < subdomains.txt)
+          fi
+
+          if [ "$COUNT" -gt 0 ]; then
+            MSG="✅ *Enumeration Complete*\n*Domain:* ${DOMAIN}\n*Subdomains Found:* ${COUNT}"
+            # if file size <= 49MB send as document, else upload as artifact only
+            MAX_BYTES=$((49 * 1024 * 1024))
+            FILE_SIZE=0
+            if [ -f subdomains.txt ]; then FILE_SIZE=$(stat -c%s subdomains.txt); fi
+
+            if [ "$FILE_SIZE" -le "$MAX_BYTES" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${CHAT_ID}" \
+                -F "document=@subdomains.txt" \
+                -F "caption=${MSG}" \
+                -F "parse_mode=Markdown"
+            else
+              # too big for telegram, let user download as artifact
+              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${CHAT_ID}" \
+                --data-urlencode "text=✅ *Enumeration Complete* (${COUNT} subdomains) — results too large to send via Telegram, uploaded as artifact." \
+                -d "parse_mode=Markdown"
+            fi
+          else
+            MSG="❌ *No subdomains found* for ${DOMAIN}"
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${MSG}" \
+              -d "parse_mode=Markdown"
+          fi
+
+      - name: Run Nuclei
+        run: |
+          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt || true
+          echo "VULNS_FOUND=$(wc -l < nuclei-results.txt || true)" >> $GITHUB_ENV
+
+      - name: Notify Vulnerabilities (Telegram / or upload if too big)
+        env:
+          BOT_TOKEN: ${{ env.BOT_TOKEN }}
+          CHAT_ID: ${{ env.CHAT_ID }}
+        run: |
+          BOT_TOKEN="${BOT_TOKEN}"
+          CHAT_ID="${CHAT_ID}"
+          COUNT=0
+          if [ -f nuclei-results.txt ]; then
+            COUNT=$(wc -l < nuclei-results.txt)
+          fi
+
+          if [ "$COUNT" -gt 0 ]; then
+            MSG="🚨 *Vulnerabilities Found!* (${COUNT})\nDomain: ${DOMAIN}"
+            MAX_BYTES=$((49 * 1024 * 1024))
+            FILE_SIZE=0
+            if [ -f nuclei-results.txt ]; then FILE_SIZE=$(stat -c%s nuclei-results.txt); fi
+
+            if [ "$FILE_SIZE" -le "$MAX_BYTES" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${CHAT_ID}" \
+                -F "document=@nuclei-results.txt" \
+                -F "caption=${MSG}" \
+                -F "parse_mode=Markdown"
+            else
+              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${CHAT_ID}" \
+                --data-urlencode "text=🚨 *Vulnerabilities Found!* (${COUNT}) — results too large to send via Telegram, uploaded as artifact." \
+                -d "parse_mode=Markdown"
+            fi
+          else
+            MSG="✅ *No critical/high/medium vulnerabilities found* for ${DOMAIN}"
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${MSG}" \
+              -d "parse_mode=Markdown"
+          fi
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            subdomains.txt
+            nuclei-results.txt
+            scan_output/*.txt
